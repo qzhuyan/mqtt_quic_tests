@@ -23,12 +23,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - asset: linux-x86_64
+          - asset: linux-x86_64-musl
             os: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
-          - asset: linux-aarch64
+            target: x86_64-unknown-linux-musl
+            musl: true
+          - asset: linux-aarch64-musl
             os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
+            target: aarch64-unknown-linux-musl
+            musl: true
           - asset: macos-x86_64
             os: macos-15-intel
             target: x86_64-apple-darwin
@@ -40,6 +42,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install MUSL toolchain
+        if: matrix.musl
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes binutils file musl-tools
+
       - name: Use stable Rust
         run: |
           rustup update stable
@@ -47,7 +55,34 @@ jobs:
           rustup target add ${{ matrix.target }}
 
       - name: Build
-        run: cargo build --locked --release --bin mqtt_quic_test --target ${{ matrix.target }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ matrix.target }}" == *-linux-musl ]]; then
+            target_env="${{ matrix.target }}"
+            target_env="${target_env^^}"
+            target_env="${target_env//-/_}"
+            cc_env="CC_${{ matrix.target }}"
+            cc_env="${cc_env//-/_}"
+            env \
+              "CARGO_TARGET_${target_env}_LINKER=musl-gcc" \
+              "${cc_env}=musl-gcc" \
+              cargo build --locked --release --bin mqtt_quic_test --target "${{ matrix.target }}"
+          else
+            cargo build --locked --release --bin mqtt_quic_test --target "${{ matrix.target }}"
+          fi
+
+      - name: Verify static MUSL binary
+        if: matrix.musl
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="target/${{ matrix.target }}/release/mqtt_quic_test"
+          file "$binary"
+          if readelf --program-headers --wide "$binary" | grep -q INTERP; then
+            echo "Expected a static MUSL binary, but an ELF interpreter is present" >&2
+            exit 1
+          fi
 
       - name: Package
         shell: bash

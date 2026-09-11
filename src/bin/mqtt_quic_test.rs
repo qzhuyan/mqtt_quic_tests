@@ -56,6 +56,9 @@ struct Cli {
     maximum_packet_size: Option<u32>,
 
     #[arg(long)]
+    topic_alias_maximum: Option<u16>,
+
+    #[arg(long)]
     insecure: bool,
 
     #[arg(long)]
@@ -119,6 +122,7 @@ impl Cli {
             clean_start: self.clean_start,
             session_expiry_interval: self.session_expiry_interval,
             maximum_packet_size: self.maximum_packet_size,
+            topic_alias_maximum: self.topic_alias_maximum,
             insecure_skip_verify: self.insecure,
             ca_file: self.ca_file,
             cert_file: self.cert_file,
