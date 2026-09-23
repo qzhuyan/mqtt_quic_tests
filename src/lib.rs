@@ -458,6 +458,22 @@ impl ScenarioReport {
                         .push(format!("disconnected with reason code {code}"));
                 }
             }
+            MqttEvent::DisconnectReceived { reason_code, .. } => {
+                self.disconnected = true;
+                self.disconnect_reasons.push(Some(*reason_code));
+                self.errors
+                    .push(format!("disconnected with reason code {reason_code}"));
+            }
+            MqttEvent::OperationFailed {
+                operation,
+                packet_id,
+                error,
+            } => {
+                self.errors.push(format!(
+                    "{operation:?} operation failed for packet {packet_id:?}: {error}"
+                ));
+            }
+            MqttEvent::AuthReceived(_) => {}
             MqttEvent::Subscribed(result) => {
                 self.subscribe_results.push(result.clone());
                 if result.is_success() {
@@ -903,6 +919,7 @@ impl QuicDriver {
                         MqttEvent::ReconnectNeeded
                             | MqttEvent::TransportClosed { .. }
                             | MqttEvent::Disconnected(_)
+                            | MqttEvent::DisconnectReceived { .. }
                     )
                 })
             },
@@ -2683,6 +2700,7 @@ impl QuicDriver {
                     MqttEvent::ReconnectNeeded
                         | MqttEvent::TransportClosed { .. }
                         | MqttEvent::Disconnected(_)
+                        | MqttEvent::DisconnectReceived { .. }
                         | MqttEvent::Error(_)
                 )
             })
@@ -2900,9 +2918,14 @@ impl QuicDriver {
         while Instant::now() < deadline {
             let events = self.step()?;
             for event in &events {
-                if let MqttEvent::Disconnected(reason) = event {
-                    actual = *reason;
-                    if *reason == Some(expected) {
+                let reason = match event {
+                    MqttEvent::Disconnected(reason) => *reason,
+                    MqttEvent::DisconnectReceived { reason_code, .. } => Some(*reason_code),
+                    _ => None,
+                };
+                if reason.is_some() {
+                    actual = reason;
+                    if reason == Some(expected) {
                         self.observe(&events);
                         return Ok(());
                     }
@@ -2943,9 +2966,14 @@ impl QuicDriver {
         let deadline = Instant::now() + self.cfg.timeout;
         while Instant::now() < deadline {
             let events = self.step()?;
-            let exact_disconnect = events.iter().any(
-                |event| matches!(event, MqttEvent::Disconnected(Some(reason)) if *reason == expected),
-            );
+            let exact_disconnect = events.iter().any(|event| {
+                matches!(event, MqttEvent::Disconnected(Some(reason)) if *reason == expected)
+                    || matches!(
+                        event,
+                        MqttEvent::DisconnectReceived { reason_code, .. }
+                            if *reason_code == expected
+                    )
+            });
             self.observe(&events);
             let stopped = self
                 .report
