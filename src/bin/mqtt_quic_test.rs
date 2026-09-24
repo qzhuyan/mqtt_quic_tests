@@ -1,5 +1,5 @@
 use clap::{ArgAction, Parser};
-use mqtt_quic_tests::{run, RunConfig, Scenario};
+use mqtt_quic_tests::{run, RunConfig, Scenario, StreamShutdownMode};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -90,6 +90,24 @@ struct Cli {
 
     #[arg(long, default_value_t = 42)]
     stream_error_code: u64,
+
+    #[arg(long, default_value_t = StreamShutdownMode::Graceful, value_parser = StreamShutdownMode::parse)]
+    stream_shutdown_mode: StreamShutdownMode,
+
+    #[arg(long)]
+    will: bool,
+
+    #[arg(long)]
+    will_topic: Option<String>,
+
+    #[arg(long, default_value = "will message")]
+    will_payload: String,
+
+    #[arg(long, default_value_t = 0, value_parser = parse_qos)]
+    will_qos: u8,
+
+    #[arg(long, default_value_t = false, value_parser = parse_bool, action = ArgAction::Set)]
+    will_retain: bool,
 }
 
 fn main() {
@@ -138,6 +156,12 @@ impl Cli {
             zero_rtt_session_cache_size: self.zero_rtt_session_cache_size,
             zero_rtt_replay_on_reject: self.zero_rtt_replay_on_reject,
             stream_error_code: self.stream_error_code,
+            stream_shutdown_mode: self.stream_shutdown_mode,
+            will_enabled: self.will,
+            will_topic: self.will_topic,
+            will_payload: self.will_payload.into_bytes(),
+            will_qos: self.will_qos,
+            will_retain: self.will_retain,
         }
     }
 }
