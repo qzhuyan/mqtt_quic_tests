@@ -8,7 +8,9 @@ use flowsdk::mqtt_client::{
 };
 use flowsdk::mqtt_serde::control_packet::MqttPacket;
 use flowsdk::mqtt_serde::mqttv5::common::properties::Property;
-use flowsdk::mqtt_serde::mqttv5::{connectv5, disconnectv5, subscribev5, unsubscribev5};
+use flowsdk::mqtt_serde::mqttv5::{
+    connectv5, disconnectv5, pubackv5, pubcompv5, pubrecv5, willv5::Will,
+};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
@@ -39,6 +41,10 @@ pub enum Scenario {
     StreamFinish,
     StreamReset,
     StreamStop,
+    ControlStreamShutdown,
+    ControlStreamShutdownReconnect,
+    WaitRemoteShutdown,
+    WaitRemoteShutdownReconnect,
     ManualAckQos1,
     ManualAckQos2,
     SessionResumeQos1,
@@ -65,6 +71,10 @@ pub enum Scenario {
     MqttV5PublishTooLarge,
     MqttV5SharedQos2Abort,
     MqttV5ConnackUnavailable,
+    MqttV5WillMessage,
+    MqttV5WillRetain,
+    MqttV5ConnectPacketTooLarge,
+    MqttV5WillQosRejected,
     MqttV5StatsTimer,
     MqttV5ReceiveTooLarge,
     PersistentSessionControls,
@@ -99,6 +109,10 @@ impl Scenario {
         Self::StreamFinish,
         Self::StreamReset,
         Self::StreamStop,
+        Self::ControlStreamShutdown,
+        Self::ControlStreamShutdownReconnect,
+        Self::WaitRemoteShutdown,
+        Self::WaitRemoteShutdownReconnect,
         Self::ManualAckQos1,
         Self::ManualAckQos2,
         Self::SessionResumeQos1,
@@ -125,6 +139,10 @@ impl Scenario {
         Self::MqttV5PublishTooLarge,
         Self::MqttV5SharedQos2Abort,
         Self::MqttV5ConnackUnavailable,
+        Self::MqttV5WillMessage,
+        Self::MqttV5WillRetain,
+        Self::MqttV5ConnectPacketTooLarge,
+        Self::MqttV5WillQosRejected,
         Self::MqttV5StatsTimer,
         Self::MqttV5ReceiveTooLarge,
         Self::PersistentSessionControls,
@@ -159,6 +177,10 @@ impl Scenario {
             "stream-finish" => Ok(Self::StreamFinish),
             "stream-reset" => Ok(Self::StreamReset),
             "stream-stop" => Ok(Self::StreamStop),
+            "control-stream-shutdown" => Ok(Self::ControlStreamShutdown),
+            "control-stream-shutdown-reconnect" => Ok(Self::ControlStreamShutdownReconnect),
+            "wait-remote-shutdown" => Ok(Self::WaitRemoteShutdown),
+            "wait-remote-shutdown-reconnect" => Ok(Self::WaitRemoteShutdownReconnect),
             "manual-ack-qos1" => Ok(Self::ManualAckQos1),
             "manual-ack-qos2" => Ok(Self::ManualAckQos2),
             "session-resume-qos1" => Ok(Self::SessionResumeQos1),
@@ -185,6 +207,10 @@ impl Scenario {
             "mqtt-v5-publish-too-large" => Ok(Self::MqttV5PublishTooLarge),
             "mqtt-v5-shared-qos2-abort" => Ok(Self::MqttV5SharedQos2Abort),
             "mqtt-v5-connack-unavailable" => Ok(Self::MqttV5ConnackUnavailable),
+            "mqtt-v5-will-message" => Ok(Self::MqttV5WillMessage),
+            "mqtt-v5-will-retain" => Ok(Self::MqttV5WillRetain),
+            "mqtt-v5-connect-packet-too-large" => Ok(Self::MqttV5ConnectPacketTooLarge),
+            "mqtt-v5-will-qos-rejected" => Ok(Self::MqttV5WillQosRejected),
             "mqtt-v5-stats-timer" => Ok(Self::MqttV5StatsTimer),
             "mqtt-v5-receive-too-large" => Ok(Self::MqttV5ReceiveTooLarge),
             "persistent-session-controls" => Ok(Self::PersistentSessionControls),
@@ -221,6 +247,10 @@ impl Scenario {
             Self::StreamFinish => "stream-finish",
             Self::StreamReset => "stream-reset",
             Self::StreamStop => "stream-stop",
+            Self::ControlStreamShutdown => "control-stream-shutdown",
+            Self::ControlStreamShutdownReconnect => "control-stream-shutdown-reconnect",
+            Self::WaitRemoteShutdown => "wait-remote-shutdown",
+            Self::WaitRemoteShutdownReconnect => "wait-remote-shutdown-reconnect",
             Self::ManualAckQos1 => "manual-ack-qos1",
             Self::ManualAckQos2 => "manual-ack-qos2",
             Self::SessionResumeQos1 => "session-resume-qos1",
@@ -247,6 +277,10 @@ impl Scenario {
             Self::MqttV5PublishTooLarge => "mqtt-v5-publish-too-large",
             Self::MqttV5SharedQos2Abort => "mqtt-v5-shared-qos2-abort",
             Self::MqttV5ConnackUnavailable => "mqtt-v5-connack-unavailable",
+            Self::MqttV5WillMessage => "mqtt-v5-will-message",
+            Self::MqttV5WillRetain => "mqtt-v5-will-retain",
+            Self::MqttV5ConnectPacketTooLarge => "mqtt-v5-connect-packet-too-large",
+            Self::MqttV5WillQosRejected => "mqtt-v5-will-qos-rejected",
             Self::MqttV5StatsTimer => "mqtt-v5-stats-timer",
             Self::MqttV5ReceiveTooLarge => "mqtt-v5-receive-too-large",
             Self::PersistentSessionControls => "persistent-session-controls",
@@ -305,6 +339,41 @@ impl Scenario {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamShutdownMode {
+    Graceful,
+    AbortReceive,
+    AbortSend,
+    AbortBoth,
+}
+
+impl StreamShutdownMode {
+    pub fn parse(name: &str) -> Result<Self, String> {
+        match name {
+            "graceful" => Ok(Self::Graceful),
+            "abort-receive" => Ok(Self::AbortReceive),
+            "abort-send" => Ok(Self::AbortSend),
+            "abort-both" => Ok(Self::AbortBoth),
+            other => Err(format!("unknown stream shutdown mode: {other}")),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Graceful => "graceful",
+            Self::AbortReceive => "abort-receive",
+            Self::AbortSend => "abort-send",
+            Self::AbortBoth => "abort-both",
+        }
+    }
+}
+
+impl fmt::Display for StreamShutdownMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RunConfig {
     pub host: String,
@@ -334,6 +403,12 @@ pub struct RunConfig {
     pub zero_rtt_session_cache_size: usize,
     pub zero_rtt_replay_on_reject: bool,
     pub stream_error_code: u64,
+    pub stream_shutdown_mode: StreamShutdownMode,
+    pub will_enabled: bool,
+    pub will_topic: Option<String>,
+    pub will_payload: Vec<u8>,
+    pub will_qos: u8,
+    pub will_retain: bool,
 }
 
 impl Default for RunConfig {
@@ -366,6 +441,12 @@ impl Default for RunConfig {
             zero_rtt_session_cache_size: 256,
             zero_rtt_replay_on_reject: true,
             stream_error_code: 42,
+            stream_shutdown_mode: StreamShutdownMode::Graceful,
+            will_enabled: false,
+            will_topic: None,
+            will_payload: b"will message".to_vec(),
+            will_qos: 0,
+            will_retain: false,
         }
     }
 }
@@ -652,6 +733,14 @@ impl QuicDriver {
         if !connect_properties.is_empty() {
             opts = opts.connect_properties(connect_properties);
         }
+        if cfg.will_enabled {
+            opts = opts.will(Will::new(
+                cfg.will_topic.clone().unwrap_or_else(|| cfg.topic.clone()),
+                cfg.will_payload.clone(),
+                cfg.will_qos,
+                cfg.will_retain,
+            ));
+        }
 
         let crypto = build_crypto_config(&cfg)?;
         let mut engine = QuicMqttEngine::new(opts.build())?;
@@ -674,23 +763,35 @@ impl QuicDriver {
     }
 
     fn run_scenario(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        if self.cfg.scenario == Scenario::MqttV5ConnackUnavailable {
-            self.scenario_mqtt_v5_connack_unavailable()?;
-            return Ok(());
+        match self.cfg.scenario {
+            Scenario::MqttV5ConnackUnavailable => {
+                self.scenario_mqtt_v5_connack_unavailable()?;
+                return Ok(());
+            }
+            Scenario::MqttV5ConnectPacketTooLarge => {
+                self.scenario_connect_rejected(None)?;
+                return Ok(());
+            }
+            Scenario::MqttV5WillQosRejected => {
+                self.scenario_connect_rejected(Some(0x9b))?;
+                return Ok(());
+            }
+            _ => {}
         }
         self.wait_connected()?;
         if !matches!(
             self.cfg.scenario,
-            Scenario::MqttV5StatsTimer | Scenario::MqttV5ReceiveTooLarge
+            Scenario::MqttV5StatsTimer
+                | Scenario::MqttV5ReceiveTooLarge
+                | Scenario::WaitRemoteShutdown
+                | Scenario::WaitRemoteShutdownReconnect
         ) {
             self.write_ready_file()?;
         }
         match self.cfg.scenario {
             Scenario::Connect => {
                 self.drive_for(self.cfg.hold_after_connect)?;
-                self.engine
-                    .disconnect_and_close(0, b"connect scenario complete")?;
-                self.drive_for(Duration::from_millis(100))?;
+                self.graceful_disconnect()?;
             }
             Scenario::PubSub => self.scenario_pubsub()?,
             Scenario::MultiStream => self.scenario_multistream()?,
@@ -709,6 +810,12 @@ impl QuicDriver {
             Scenario::StreamFinish => self.scenario_stream_finish()?,
             Scenario::StreamReset => self.scenario_stream_reset()?,
             Scenario::StreamStop => self.scenario_stream_stop()?,
+            Scenario::ControlStreamShutdown => self.scenario_control_stream_shutdown(false)?,
+            Scenario::ControlStreamShutdownReconnect => {
+                self.scenario_control_stream_shutdown(true)?
+            }
+            Scenario::WaitRemoteShutdown => self.scenario_wait_remote_shutdown(false)?,
+            Scenario::WaitRemoteShutdownReconnect => self.scenario_wait_remote_shutdown(true)?,
             Scenario::ManualAckQos1 => self.scenario_manual_ack(1)?,
             Scenario::ManualAckQos2 => self.scenario_manual_ack(2)?,
             Scenario::SessionResumeQos1 => self.scenario_session_resume(1)?,
@@ -737,6 +844,11 @@ impl QuicDriver {
             Scenario::MqttV5StatsTimer => self.scenario_mqtt_v5_stats_timer()?,
             Scenario::MqttV5ReceiveTooLarge => self.scenario_mqtt_v5_receive_too_large()?,
             Scenario::MqttV5ConnackUnavailable => unreachable!(),
+            Scenario::MqttV5WillMessage => self.scenario_mqtt_v5_will_message()?,
+            Scenario::MqttV5WillRetain => self.scenario_mqtt_v5_will_retain()?,
+            Scenario::MqttV5ConnectPacketTooLarge | Scenario::MqttV5WillQosRejected => {
+                unreachable!()
+            }
             Scenario::PersistentSessionControls => self.scenario_persistent_session_controls()?,
             Scenario::PersistentOfflineQos1 => self.scenario_persistent_offline(1)?,
             Scenario::PersistentOfflineQos2 => self.scenario_persistent_offline(2)?,
@@ -868,19 +980,22 @@ impl QuicDriver {
         self.seed_zero_rtt_ticket()?;
         self.start_zero_rtt_reconnect(true)?;
         let topic = self.cfg.topic.clone();
-        let payload = self.cfg.payload.clone();
+        let payload = b"qos 2 1".repeat(1600);
+        let mut second_payload = b"2nd part".to_vec();
+        second_payload.extend_from_slice(&payload);
         let stream = self.engine.open_data_stream()?;
         self.engine
             .subscribe_on(stream, subscribe_cmd(&topic, self.cfg.sub_qos)?)?;
-        self.wait_connected()?;
-        self.drive_until("0-RTT stream SUBACK", |events| {
-            events
-                .iter()
-                .any(|event| matches!(event, MqttEvent::Subscribed(result) if result.is_success()))
-        })?;
         self.engine
             .publish_on(stream, publish_cmd(&topic, &payload, self.cfg.pub_qos)?)?;
-        self.wait_for_publish_and_message(&topic, &payload)
+        self.wait_connected()?;
+        self.wait_for_publish_and_message(&topic, &payload)?;
+
+        self.engine.publish_on(
+            stream,
+            publish_cmd(&topic, &second_payload, self.cfg.pub_qos)?,
+        )?;
+        self.wait_for_publish_and_message(&topic, &second_payload)
     }
 
     fn scenario_conn_resume(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -977,6 +1092,71 @@ impl QuicDriver {
         Ok(())
     }
 
+    fn scenario_control_stream_shutdown(
+        &mut self,
+        reconnect: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.scenario_multistream()?;
+        self.shutdown_control_stream()?;
+        self.wait_for_transport_shutdown()?;
+        if reconnect {
+            self.reconnect_and_wait()?;
+            self.scenario_multistream()?;
+        }
+        Ok(())
+    }
+
+    fn scenario_wait_remote_shutdown(
+        &mut self,
+        reconnect: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.scenario_multistream()?;
+        self.write_ready_file()?;
+        self.wait_for_transport_shutdown()?;
+        if reconnect {
+            self.reconnect_and_wait()?;
+            self.scenario_multistream()?;
+        }
+        Ok(())
+    }
+
+    fn shutdown_control_stream(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let stream = self
+            .engine
+            .control_stream_id()
+            .ok_or("MQTT control stream is not available")?;
+        match self.cfg.stream_shutdown_mode {
+            StreamShutdownMode::Graceful => self.engine.finish_stream(stream)?,
+            StreamShutdownMode::AbortReceive => self
+                .engine
+                .stop_stream(stream, self.cfg.stream_error_code)?,
+            StreamShutdownMode::AbortSend => self
+                .engine
+                .reset_stream(stream, self.cfg.stream_error_code)?,
+            StreamShutdownMode::AbortBoth => {
+                self.engine
+                    .stop_stream(stream, self.cfg.stream_error_code)?;
+                self.engine
+                    .reset_stream(stream, self.cfg.stream_error_code)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn wait_for_transport_shutdown(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.drive_until("transport shutdown", |events| {
+            events.iter().any(|event| {
+                matches!(
+                    event,
+                    MqttEvent::TransportClosed { .. }
+                        | MqttEvent::Disconnected(_)
+                        | MqttEvent::DisconnectReceived { .. }
+                        | MqttEvent::ReconnectNeeded
+                )
+            })
+        })
+    }
+
     fn scenario_manual_ack(&mut self, qos: u8) -> Result<(), Box<dyn std::error::Error>> {
         let topic = self.cfg.topic.clone();
         let payload = self.cfg.payload.clone();
@@ -994,16 +1174,25 @@ impl QuicDriver {
         let (packet_id, message_stream) = self.wait_for_message_info(&topic, &payload)?;
         match qos {
             1 => {
-                self.engine
-                    .puback_on(message_stream.unwrap_or(sub_stream), packet_id)?;
+                let ack_stream = self.stream_or_control(message_stream)?;
+                self.engine.acknowledge_on(
+                    ack_stream,
+                    MqttPacket::PubAck5(pubackv5::MqttPubAck::new(packet_id, 0, Vec::new())),
+                )?;
                 self.report.manual_acks += 1;
             }
             2 => {
-                let ack_stream = message_stream.unwrap_or(sub_stream);
-                self.engine.pubrec_on(ack_stream, packet_id)?;
+                let ack_stream = self.stream_or_control(message_stream)?;
+                self.engine.acknowledge_on(
+                    ack_stream,
+                    MqttPacket::PubRec5(pubrecv5::MqttPubRec::new(packet_id, 0, Vec::new())),
+                )?;
                 self.report.manual_acks += 1;
                 self.wait_for_pubrel(packet_id, Some(ack_stream))?;
-                self.engine.pubcomp_on(ack_stream, packet_id)?;
+                self.engine.acknowledge_on(
+                    ack_stream,
+                    MqttPacket::PubComp5(pubcompv5::MqttPubComp::new(packet_id, 0, Vec::new())),
+                )?;
                 self.report.manual_acks += 1;
             }
             _ => {}
@@ -1015,56 +1204,79 @@ impl QuicDriver {
     fn scenario_session_resume(&mut self, qos: u8) -> Result<(), Box<dyn std::error::Error>> {
         let topic = self.cfg.topic.clone();
         let payload = self.cfg.payload.clone();
-        let sub_stream = self.engine.open_data_stream()?;
-        let pub_stream = self.engine.open_data_stream()?;
-        self.engine
-            .subscribe_on(sub_stream, subscribe_cmd(&topic, qos)?)?;
+        self.send_subscribe_on_control(subscribe_cmd(&topic, qos)?)?;
         self.drive_until("session-resume SUBACK", |events| {
             events
                 .iter()
                 .any(|event| matches!(event, MqttEvent::Subscribed(result) if result.is_success()))
         })?;
-        self.engine
+        let mut publisher = self.connect_peer(
+            &format!("{}-resume-publisher", self.cfg.client_id),
+            true,
+            None,
+            Scenario::Connect,
+        )?;
+        let pub_stream = publisher.engine.open_data_stream()?;
+        publisher
+            .engine
             .publish_on(pub_stream, publish_cmd(&topic, &payload, qos)?)?;
-        let (packet_id, first_message_stream) = self.wait_for_message_info(&topic, &payload)?;
+        publisher.wait_for_publish_result()?;
+
+        let messages_before = self.received_publishes.len();
+        let (packet_id, message_stream) = self.wait_for_message_info(&topic, &payload)?;
+        let pubrels_before = self.pubrels.len();
         if qos == 2 {
-            self.engine
-                .pubrec_on(first_message_stream.unwrap_or(sub_stream), packet_id)?;
+            let ack_stream = self.stream_or_control(message_stream)?;
+            self.engine.acknowledge_on(
+                ack_stream,
+                MqttPacket::PubRec5(pubrecv5::MqttPubRec::new(packet_id, 0, Vec::new())),
+            )?;
             self.report.manual_acks += 1;
+            self.flush_outgoing_once()?;
         }
         self.reconnect_and_wait()?;
-        let resume_stream = self.engine.open_data_stream()?;
-        if qos == 1 {
-            self.engine
-                .subscribe_on(resume_stream, subscribe_cmd(&topic, qos)?)?;
-            self.drive_until("session-resume re-SUBACK", |events| {
-                events.iter().any(
-                    |event| matches!(event, MqttEvent::Subscribed(result) if result.is_success()),
-                )
-            })?;
+        if !self.last_connection_result()?.session_present {
+            return Err("session-resume reconnect did not set Session Present".into());
         }
-        let (resumed_packet_id, resumed_message_stream) = if qos == 1 {
-            self.wait_for_message_info(&topic, &payload)?
-        } else {
-            (packet_id, first_message_stream)
-        };
         match qos {
             1 => {
-                self.engine.puback_on(
-                    resumed_message_stream.unwrap_or(resume_stream),
-                    resumed_packet_id,
+                self.wait_for_message_after(&topic, &payload, messages_before + 1)?;
+                let (resumed_packet_id, resumed_stream) = self
+                    .received_publishes
+                    .iter()
+                    .skip(messages_before + 1)
+                    .find(|message| message.topic == topic && message.payload == payload)
+                    .ok_or("resumed QoS 1 PUBLISH was not captured")
+                    .and_then(|message| {
+                        message
+                            .packet_id
+                            .map(|packet_id| (packet_id, message.stream))
+                            .ok_or("resumed QoS 1 PUBLISH did not carry a packet id")
+                    })?;
+                let ack_stream = self.stream_or_control(resumed_stream)?;
+                self.engine.acknowledge_on(
+                    ack_stream,
+                    MqttPacket::PubAck5(pubackv5::MqttPubAck::new(
+                        resumed_packet_id,
+                        0,
+                        Vec::new(),
+                    )),
                 )?;
                 self.report.manual_acks += 1;
             }
             2 => {
-                let pubrel_stream = self.wait_for_pubrel(packet_id, None)?;
-                self.engine
-                    .pubcomp_on(pubrel_stream.unwrap_or(resume_stream), packet_id)?;
+                let pubrel_stream = self.wait_for_pubrel_after(packet_id, None, pubrels_before)?;
+                let ack_stream = self.stream_or_control(pubrel_stream)?;
+                self.engine.acknowledge_on(
+                    ack_stream,
+                    MqttPacket::PubComp5(pubcompv5::MqttPubComp::new(packet_id, 0, Vec::new())),
+                )?;
                 self.report.manual_acks += 1;
             }
             _ => {}
         }
-        self.drive_for(Duration::from_millis(100))
+        self.flush_outgoing_once()?;
+        publisher.graceful_disconnect()
     }
 
     fn scenario_source_bind(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -1078,12 +1290,20 @@ impl QuicDriver {
     }
 
     fn scenario_source_rebind(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.scenario_pubsub()?;
+        let old_addr = self.socket.local_addr()?;
         self.rebind_socket()?;
+        if self.socket.local_addr()? == old_addr {
+            return Err("source rebind reused the original local address".into());
+        }
         self.engine.notify_local_address_changed()?;
         self.engine.quic_ping()?;
         self.report.quic_pings += 1;
         self.drive_for(Duration::from_millis(1_000))?;
-        self.scenario_pubsub()
+        if !self.engine.is_connected() || self.report.transport_closed > 0 {
+            return Err("connection closed after source-address rebind".into());
+        }
+        Ok(())
     }
 
     fn scenario_parallel_publish(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -1122,6 +1342,7 @@ impl QuicDriver {
             .map(|_| self.engine.open_data_stream())
             .collect::<Result<Vec<_>, _>>()?;
         let seen_before = self.received_publishes.len();
+        let published_before = self.report.published;
 
         for n in 1..=100 {
             let ctrl_payload = tagged_payload(&self.cfg.payload, format!("-ctrl-{n}").as_bytes());
@@ -1140,6 +1361,9 @@ impl QuicDriver {
 
             if n % 4 == 0 {
                 self.wait_for_topic_message_count_after(&topic, seen_before, n * 6)?;
+                if self.cfg.pub_qos > 0 {
+                    self.wait_for_publish_count_after(published_before, n * 6)?;
+                }
             } else {
                 self.drive_for(Duration::from_millis(1))?;
             }
@@ -1276,17 +1500,21 @@ impl QuicDriver {
         let seen_before = self.received_publishes.len();
         self.engine
             .publish_on(pub_stream, publish_cmd(&topic, &payload, self.cfg.pub_qos)?)?;
-        self.wait_for_message_after(&topic, &payload, seen_before)?;
-        self.drive_for(Duration::from_millis(250))?;
-        let delivered = self
+        self.wait_for_topic_message_count_after(&topic, seen_before, 2)?;
+        let topic_deliveries = self
             .received_publishes
             .iter()
             .skip(seen_before)
-            .filter(|message| message.topic == topic && message.payload == payload)
+            .filter(|message| message.topic == topic)
+            .collect::<Vec<_>>();
+        let delivered = topic_deliveries
+            .iter()
+            .filter(|message| message.payload == payload)
             .count();
         if delivered != 2 {
             return Err(format!(
-                "expected two deliveries after duplicate subscribe, got {delivered}"
+                "expected two deliveries after duplicate subscribe, got {delivered}; \
+                 topic deliveries: {topic_deliveries:?}"
             )
             .into());
         }
@@ -1334,8 +1562,8 @@ impl QuicDriver {
             .publish_on(stream, publish_cmd(&topic, &ok_payload, self.cfg.pub_qos)?)?;
         self.wait_for_publish_and_message(&topic, &ok_payload)?;
         let seen_before = self.received_publishes.len();
-        self.engine
-            .publish_on(stream, publish_cmd(&topic, &payload, self.cfg.pub_qos)?)?;
+        let oversized_packet = mqtt_v5_publish_bytes(&topic, &payload, self.cfg.pub_qos, 0x7ffe)?;
+        self.engine.send_raw_on(stream, &oversized_packet)?;
         self.drive_for(Duration::from_millis(250))?;
         if self
             .received_publishes
@@ -1390,7 +1618,7 @@ impl QuicDriver {
             .publish(publish_cmd(&topic_a, b"topic-alias-2", 0)?)?;
         self.wait_for_received_publish_count(first + 2)?;
         let second_message = &self.received_publishes[first + 1];
-        if !second_message.topic.is_empty()
+        if second_message.topic != topic_a
             || !has_property(&second_message.properties, &Property::TopicAlias(1))
         {
             return Err(format!("reused alias delivery was unexpected: {second_message:?}").into());
@@ -1652,7 +1880,7 @@ impl QuicDriver {
             .subscribe(subscribe_cmd(&properties_topic, 2)?)?;
         self.wait_for_suback()?;
         let expected_properties = vec![
-            Property::PayloadFormatIndicator(233),
+            Property::PayloadFormatIndicator(1),
             Property::ResponseTopic(properties_topic.clone()),
             Property::CorrelationData(b"233".to_vec()),
             Property::UserProperty("a".to_string(), "2333".to_string()),
@@ -1772,7 +2000,8 @@ impl QuicDriver {
 
     fn scenario_mqtt_v5_invalid_packets(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let wildcard_topic = format!("{}/+", self.cfg.topic);
-        self.send_publish_on_control(publish_cmd(&wildcard_topic, b"wildcard-topic", 0)?)?;
+        let wildcard = mqtt_v5_publish_bytes(&wildcard_topic, b"wildcard-topic", 0, 0)?;
+        self.send_raw_on_control(&wildcard)?;
         self.wait_for_protocol_rejection(0x90)?;
 
         let mut response = self.connect_peer(
@@ -1781,13 +2010,16 @@ impl QuicDriver {
             None,
             Scenario::Connect,
         )?;
-        response.send_publish_on_control(
-            PublishCommand::builder()
-                .topic(&self.cfg.topic)
-                .payload(b"response-topic".to_vec())
-                .with_response_topic("response/+")
-                .build()?,
+        let mut response_properties = vec![0x08];
+        encode_mqtt_utf8("response/+", &mut response_properties)?;
+        let invalid_response = mqtt_v5_publish_bytes_with_properties(
+            &self.cfg.topic,
+            b"response-topic",
+            0,
+            0,
+            &response_properties,
         )?;
+        response.send_raw_on_control(&invalid_response)?;
         response.wait_for_protocol_rejection(0x82)?;
 
         let mut alias_zero = self.connect_peer(
@@ -1796,13 +2028,14 @@ impl QuicDriver {
             None,
             Scenario::Connect,
         )?;
-        alias_zero.send_publish_on_control(
-            PublishCommand::builder()
-                .topic(&self.cfg.topic)
-                .payload(b"alias-zero".to_vec())
-                .with_topic_alias(0)
-                .build()?,
+        let invalid_alias = mqtt_v5_publish_bytes_with_properties(
+            &self.cfg.topic,
+            b"alias-zero",
+            0,
+            0,
+            &[0x23, 0x00, 0x00],
         )?;
+        alias_zero.send_raw_on_control(&invalid_alias)?;
         alias_zero.wait_for_protocol_rejection(0x94)?;
 
         let mut alias = self.connect_peer(
@@ -1838,11 +2071,8 @@ impl QuicDriver {
             None,
             Scenario::Connect,
         )?;
-        shared.engine.subscribe(
-            SubscribeCommand::builder()
-                .add_topic_with_options("$share/group/topic", 1, true, false, 0)
-                .build()?,
-        )?;
+        let invalid_shared = mqtt_v5_subscribe_bytes("$share/group/topic", 1, true, 0x7ffd)?;
+        shared.send_raw_on_control(&invalid_shared)?;
         shared.wait_for_protocol_rejection(0x82)
     }
 
@@ -1986,6 +2216,129 @@ impl QuicDriver {
         }
         self.report.errors.clear();
         Ok(())
+    }
+
+    fn scenario_connect_rejected(
+        &mut self,
+        expected_reason: Option<u8>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let deadline = Instant::now() + self.cfg.timeout;
+        while Instant::now() < deadline {
+            let events = self.step()?;
+            let connack = events.iter().find_map(|event| match event {
+                MqttEvent::Connected(result) => Some(result.clone()),
+                _ => None,
+            });
+            let transport_rejected = events.iter().any(|event| {
+                matches!(
+                    event,
+                    MqttEvent::TransportClosed { .. }
+                        | MqttEvent::Disconnected(_)
+                        | MqttEvent::DisconnectReceived { .. }
+                        | MqttEvent::Error(_)
+                )
+            });
+            self.observe(&events);
+
+            if let Some(result) = connack {
+                if result.is_success() {
+                    return Err("CONNECT unexpectedly succeeded".into());
+                }
+                if let Some(expected) = expected_reason {
+                    if result.reason_code != expected {
+                        return Err(format!(
+                            "CONNECT was rejected with {:#04x}, expected {expected:#04x}",
+                            result.reason_code
+                        )
+                        .into());
+                    }
+                }
+                self.report.errors.clear();
+                return Ok(());
+            }
+            if transport_rejected && expected_reason.is_none() {
+                self.report.errors.clear();
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        Err("timed out waiting for CONNECT rejection".into())
+    }
+
+    fn scenario_mqtt_v5_will_message(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let mut observer = self.trigger_will_and_receive()?;
+        let received_before = observer.received_publishes.len();
+
+        let mut graceful =
+            self.connect_peer_with_will(&format!("{}-graceful-will", self.cfg.client_id))?;
+        graceful.graceful_disconnect()?;
+        observer.drive_for(Duration::from_millis(300))?;
+        if observer.received_publishes.len() != received_before {
+            return Err("a normal DISCONNECT published the client's Will".into());
+        }
+        observer.graceful_disconnect()
+    }
+
+    fn scenario_mqtt_v5_will_retain(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let mut observer = self.trigger_will_and_receive()?;
+        if self.cfg.will_retain {
+            let topic = self
+                .cfg
+                .will_topic
+                .clone()
+                .unwrap_or_else(|| self.cfg.topic.clone());
+            observer.engine.publish(
+                PublishCommand::builder()
+                    .topic(topic)
+                    .payload(Vec::new())
+                    .qos(1)
+                    .retain(true)
+                    .build()?,
+            )?;
+            observer.wait_for_publish_result()?;
+        }
+        observer.graceful_disconnect()
+    }
+
+    fn trigger_will_and_receive(&mut self) -> Result<Self, Box<dyn std::error::Error>> {
+        if !self.cfg.will_enabled {
+            return Err("Will scenario requires --will".into());
+        }
+        let topic = self
+            .cfg
+            .will_topic
+            .clone()
+            .unwrap_or_else(|| self.cfg.topic.clone());
+        let mut observer = self.connect_peer(
+            &format!("{}-will-observer", self.cfg.client_id),
+            true,
+            None,
+            Scenario::Connect,
+        )?;
+        observer.engine.subscribe(
+            SubscribeCommand::builder()
+                .add_topic_with_options(&topic, 2, false, true, 0)
+                .build()?,
+        )?;
+        observer.wait_for_suback()?;
+
+        self.engine
+            .disconnect_and_close_with(4, Vec::new(), 0, b"disconnect with will message")?;
+        self.drive_for(Duration::from_millis(200))?;
+        let before = observer.received_publishes.len();
+        observer.wait_for_received_publish_count(before + 1)?;
+        let message = observer
+            .received_publishes
+            .last()
+            .ok_or("Will observer did not receive a message")?;
+        if message.topic != topic
+            || message.payload != self.cfg.will_payload
+            || message.qos != self.cfg.will_qos
+            || message.retain != self.cfg.will_retain
+        {
+            return Err(format!("unexpected Will delivery: {message:?}").into());
+        }
+        Ok(observer)
     }
 
     fn scenario_mqtt_v5_stats_timer(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -2721,6 +3074,28 @@ impl QuicDriver {
         cfg.scenario = scenario;
         cfg.ready_file = None;
         cfg.hold_after_connect = Duration::ZERO;
+        cfg.will_enabled = false;
+        cfg.will_topic = None;
+        self.connect_peer_with_config(cfg)
+    }
+
+    fn connect_peer_with_will(
+        &mut self,
+        client_id: &str,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut cfg = self.cfg.clone();
+        cfg.client_id = client_id.to_string();
+        cfg.scenario = Scenario::Connect;
+        cfg.ready_file = None;
+        cfg.hold_after_connect = Duration::ZERO;
+        self.connect_peer_with_config(cfg)
+    }
+
+    fn connect_peer_with_config(
+        &mut self,
+        cfg: RunConfig,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let client_id = cfg.client_id.clone();
         let mut peer = Self::connect(cfg)?;
         let deadline = Instant::now() + self.cfg.timeout;
         let mut connected = false;
@@ -2789,8 +3164,17 @@ impl QuicDriver {
     }
 
     fn graceful_disconnect(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        self.engine
-            .disconnect_and_close(0, b"scenario peer complete")?;
+        let stream = self
+            .engine
+            .control_stream_id()
+            .ok_or("MQTT control stream is not available")?;
+        self.engine.send_packet_on(
+            stream,
+            MqttPacket::Disconnect5(disconnectv5::MqttDisconnect::new(0, Vec::new())),
+        )?;
+        self.flush_outgoing_once()?;
+        self.drive_for(Duration::from_millis(200))?;
+        self.engine.close(0, b"scenario peer complete")?;
         self.drive_for(Duration::from_millis(100))
     }
 
@@ -2831,6 +3215,15 @@ impl QuicDriver {
         Ok(())
     }
 
+    fn send_raw_on_control(&mut self, bytes: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+        let stream = self
+            .engine
+            .control_stream_id()
+            .ok_or("MQTT control stream is not available")?;
+        self.engine.send_raw_on(stream, bytes)?;
+        Ok(())
+    }
+
     fn stream_or_control(&self, stream: Option<u64>) -> Result<u64, Box<dyn std::error::Error>> {
         stream
             .or_else(|| self.engine.control_stream_id())
@@ -2856,43 +3249,17 @@ impl QuicDriver {
 
     fn send_subscribe_on_control(
         &mut self,
-        mut command: SubscribeCommand,
+        command: SubscribeCommand,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let packet_id = command.packet_id.unwrap_or(0x7ffd);
-        command.packet_id = Some(packet_id);
-        let stream = self
-            .engine
-            .control_stream_id()
-            .ok_or("MQTT control stream is not available")?;
-        self.engine.send_packet_on(
-            stream,
-            MqttPacket::Subscribe5(subscribev5::MqttSubscribe::new(
-                packet_id,
-                command.subscriptions,
-                command.properties,
-            )),
-        )?;
+        self.engine.subscribe_on_control(command)?;
         Ok(())
     }
 
     fn send_unsubscribe_on_control(
         &mut self,
-        mut command: UnsubscribeCommand,
+        command: UnsubscribeCommand,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let packet_id = command.packet_id.unwrap_or(0x7ffc);
-        command.packet_id = Some(packet_id);
-        let stream = self
-            .engine
-            .control_stream_id()
-            .ok_or("MQTT control stream is not available")?;
-        self.engine.send_packet_on(
-            stream,
-            MqttPacket::Unsubscribe5(unsubscribev5::MqttUnsubscribe::new(
-                packet_id,
-                command.topics,
-                command.properties,
-            )),
-        )?;
+        self.engine.unsubscribe_on_control(command)?;
         Ok(())
     }
 
@@ -2900,11 +3267,7 @@ impl QuicDriver {
         &mut self,
         expected: u8,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        if self
-            .report
-            .disconnect_reasons
-            .iter()
-            .any(|reason| *reason == Some(expected))
+        if self.report.disconnect_reasons.contains(&Some(expected))
             || self
                 .report
                 .stream_stop_events
@@ -3032,6 +3395,26 @@ impl QuicDriver {
             false
         })?;
         result.ok_or_else(|| "publish result event was not captured".into())
+    }
+
+    fn wait_for_publish_count_after(
+        &mut self,
+        published_before: usize,
+        expected: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut published = self.report.published.saturating_sub(published_before);
+        if published >= expected {
+            return Ok(());
+        }
+        self.drive_until("publish acknowledgements", |events| {
+            published += events
+                .iter()
+                .filter(
+                    |event| matches!(event, MqttEvent::Published(result) if result.is_success()),
+                )
+                .count();
+            published >= expected
+        })
     }
 
     fn publish_batch_from_peer_and_wait(
@@ -3295,19 +3678,18 @@ impl QuicDriver {
                     MqttEvent::PublishReceived { packet_id, stream } => {
                         pending_meta = Some((*packet_id, *stream));
                     }
-                    MqttEvent::MessageReceived(message) => {
+                    MqttEvent::MessageReceived(message)
                         if message.topic_name == expected_topic
-                            && message.payload == expected_payload
-                        {
-                            let stream = pending_meta.and_then(|(packet_id, stream)| {
-                                if packet_id == message.packet_id {
-                                    stream
-                                } else {
-                                    None
-                                }
-                            });
-                            message_info = message.packet_id.map(|packet_id| (packet_id, stream));
-                        }
+                            && message.payload == expected_payload =>
+                    {
+                        let stream = pending_meta.and_then(|(packet_id, stream)| {
+                            if packet_id == message.packet_id {
+                                stream
+                            } else {
+                                None
+                            }
+                        });
+                        message_info = message.packet_id.map(|packet_id| (packet_id, stream));
                     }
                     _ => {}
                 }
@@ -3322,9 +3704,18 @@ impl QuicDriver {
         packet_id: u16,
         expected_stream: Option<u64>,
     ) -> Result<Option<u64>, Box<dyn std::error::Error>> {
-        if let Some(pubrel) = self.pubrels.iter().find(|pubrel| {
+        self.wait_for_pubrel_after(packet_id, expected_stream, 0)
+    }
+
+    fn wait_for_pubrel_after(
+        &mut self,
+        packet_id: u16,
+        expected_stream: Option<u64>,
+        seen_before: usize,
+    ) -> Result<Option<u64>, Box<dyn std::error::Error>> {
+        if let Some(pubrel) = self.pubrels.iter().skip(seen_before).find(|pubrel| {
             pubrel.packet_id == packet_id
-                && expected_stream.map_or(true, |stream| Some(stream) == pubrel.stream)
+                && (expected_stream.is_none() || expected_stream == pubrel.stream)
         }) {
             return Ok(pubrel.stream);
         }
@@ -3352,7 +3743,7 @@ impl QuicDriver {
         if let Err(err) = result {
             return Err(format!(
                 "{err}; expected packet id {packet_id}, observed PUBRELs {:?}",
-                self.pubrels
+                &self.pubrels[seen_before.min(self.pubrels.len())..]
             )
             .into());
         }
@@ -3371,18 +3762,22 @@ impl QuicDriver {
         require_attempted: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         self.engine.close_silent();
-        let zero_rtt = QuicZeroRttConfig {
-            session_cache_size: self.cfg.zero_rtt_session_cache_size,
-            replay_on_reject: self.cfg.zero_rtt_replay_on_reject,
-        };
-        let crypto = build_crypto_config(&self.cfg)?;
-        self.engine.connect_with_zero_rtt(
-            self.server_addr,
-            &self.cfg.server_name,
-            crypto,
-            zero_rtt,
-            Instant::now(),
-        )?;
+        if require_attempted {
+            self.engine.reconnect(Instant::now())?;
+        } else {
+            let zero_rtt = QuicZeroRttConfig {
+                session_cache_size: self.cfg.zero_rtt_session_cache_size,
+                replay_on_reject: self.cfg.zero_rtt_replay_on_reject,
+            };
+            let crypto = build_crypto_config(&self.cfg)?;
+            self.engine.connect_with_zero_rtt(
+                self.server_addr,
+                &self.cfg.server_name,
+                crypto,
+                zero_rtt,
+                Instant::now(),
+            )?;
+        }
         self.report.reconnects += 1;
         if require_attempted && self.engine.zero_rtt_status() != QuicZeroRttStatus::Attempted {
             let events = self.engine.take_events();
@@ -3644,22 +4039,29 @@ fn mqtt_v5_publish_bytes(
     qos: u8,
     packet_id: u16,
 ) -> Result<Vec<u8>, MqttClientError> {
+    mqtt_v5_publish_bytes_with_properties(topic, payload, qos, packet_id, &[])
+}
+
+fn mqtt_v5_publish_bytes_with_properties(
+    topic: &str,
+    payload: &[u8],
+    qos: u8,
+    packet_id: u16,
+    properties: &[u8],
+) -> Result<Vec<u8>, MqttClientError> {
     if qos > 2 {
         return Err(MqttClientError::ProtocolViolation {
             message: format!("invalid publish QoS {qos}"),
         });
     }
 
-    let topic_len = u16::try_from(topic.len()).map_err(|_| MqttClientError::ProtocolViolation {
-        message: "topic is too long".to_string(),
-    })?;
-    let mut body = Vec::with_capacity(2 + topic.len() + 2 + 1 + payload.len());
-    body.extend_from_slice(&topic_len.to_be_bytes());
-    body.extend_from_slice(topic.as_bytes());
+    let mut body = Vec::with_capacity(2 + topic.len() + 2 + 4 + properties.len() + payload.len());
+    encode_mqtt_utf8(topic, &mut body)?;
     if qos > 0 {
         body.extend_from_slice(&packet_id.to_be_bytes());
     }
-    body.push(0);
+    encode_remaining_length(properties.len(), &mut body)?;
+    body.extend_from_slice(properties);
     body.extend_from_slice(payload);
 
     let mut packet = Vec::with_capacity(1 + 4 + body.len());
@@ -3667,6 +4069,39 @@ fn mqtt_v5_publish_bytes(
     encode_remaining_length(body.len(), &mut packet)?;
     packet.extend_from_slice(&body);
     Ok(packet)
+}
+
+fn mqtt_v5_subscribe_bytes(
+    topic_filter: &str,
+    qos: u8,
+    no_local: bool,
+    packet_id: u16,
+) -> Result<Vec<u8>, MqttClientError> {
+    if qos > 2 || packet_id == 0 {
+        return Err(MqttClientError::ProtocolViolation {
+            message: "invalid raw SUBSCRIBE parameters".to_string(),
+        });
+    }
+    let mut body = Vec::with_capacity(2 + 1 + 2 + topic_filter.len() + 1);
+    body.extend_from_slice(&packet_id.to_be_bytes());
+    body.push(0);
+    encode_mqtt_utf8(topic_filter, &mut body)?;
+    body.push(qos | if no_local { 0x04 } else { 0 });
+
+    let mut packet = Vec::with_capacity(1 + 4 + body.len());
+    packet.push(0x82);
+    encode_remaining_length(body.len(), &mut packet)?;
+    packet.extend_from_slice(&body);
+    Ok(packet)
+}
+
+fn encode_mqtt_utf8(value: &str, out: &mut Vec<u8>) -> Result<(), MqttClientError> {
+    let len = u16::try_from(value.len()).map_err(|_| MqttClientError::ProtocolViolation {
+        message: "MQTT UTF-8 value is too long".to_string(),
+    })?;
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(value.as_bytes());
+    Ok(())
 }
 
 fn encode_remaining_length(mut len: usize, out: &mut Vec<u8>) -> Result<(), MqttClientError> {
@@ -3844,6 +4279,41 @@ mod tests {
                 Property::SessionExpiryInterval(30),
                 Property::MaximumPacketSize(1024),
                 Property::TopicAliasMaximum(3),
+            ]
+        );
+    }
+
+    #[test]
+    fn raw_publish_encoder_handles_each_qos() {
+        assert_eq!(
+            mqtt_v5_publish_bytes("t", b"p", 0, 0x1234).unwrap(),
+            vec![0x30, 0x05, 0x00, 0x01, b't', 0x00, b'p']
+        );
+        assert_eq!(
+            mqtt_v5_publish_bytes("t", b"p", 1, 0x1234).unwrap(),
+            vec![0x32, 0x07, 0x00, 0x01, b't', 0x12, 0x34, 0x00, b'p']
+        );
+        assert_eq!(
+            mqtt_v5_publish_bytes("t", b"p", 2, 0x1234).unwrap(),
+            vec![0x34, 0x07, 0x00, 0x01, b't', 0x12, 0x34, 0x00, b'p']
+        );
+    }
+
+    #[test]
+    fn raw_publish_encoder_preserves_invalid_properties() {
+        assert_eq!(
+            mqtt_v5_publish_bytes_with_properties("t", b"p", 0, 0, &[0x23, 0, 0]).unwrap(),
+            vec![0x30, 0x08, 0x00, 0x01, b't', 0x03, 0x23, 0, 0, b'p']
+        );
+    }
+
+    #[test]
+    fn raw_subscribe_encoder_can_set_no_local_on_shared_filter() {
+        assert_eq!(
+            mqtt_v5_subscribe_bytes("$share/g/t", 1, true, 0x1234).unwrap(),
+            vec![
+                0x82, 0x10, 0x12, 0x34, 0x00, 0x00, 0x0a, b'$', b's', b'h', b'a', b'r', b'e', b'/',
+                b'g', b'/', b't', 0x05,
             ]
         );
     }
