@@ -238,11 +238,12 @@ fn script_engine(runtime: Rc<RefCell<Runtime>>) -> Engine {
             .bytes()
             .filter(|b| !b.is_ascii_whitespace() && *b != b':')
             .collect();
-        if bytes.len() % 2 != 0 {
+        let (pairs, remainder) = bytes.as_chunks::<2>();
+        if !remainder.is_empty() {
             return Err("hex requires an even number of ASCII digits".into());
         }
-        bytes
-            .chunks_exact(2)
+        pairs
+            .iter()
             .map(|pair| {
                 let high = char::from(pair[0])
                     .to_digit(16)

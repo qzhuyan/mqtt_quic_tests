@@ -104,6 +104,16 @@ fn syntax_and_unknown_configuration_are_errors() {
 }
 
 #[test]
+fn hex_rejects_odd_digits_after_removing_separators() {
+    let report = script(r#"assert_eq(hex("00: f"), bytes("x"));"#);
+    assert_eq!(report.status, "failed");
+    assert!(report
+        .error
+        .unwrap()
+        .contains("even number of ASCII digits"));
+}
+
+#[test]
 fn malformed_hex_fails_without_panicking_on_unicode() {
     assert_eq!(
         script(r#"assert_eq(hex("é"), bytes("x"));"#).status,
