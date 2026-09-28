@@ -1,4 +1,5 @@
 use clap::{ArgAction, Parser};
+use mqtt_quic_tests::dsl::{self, ScriptOptions, Transport};
 use mqtt_quic_tests::{run, RunConfig, Scenario, StreamShutdownMode};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -7,14 +8,17 @@ use std::time::Duration;
 #[derive(Debug, Parser)]
 #[command(
     name = "mqtt_quic_test",
-    about = "FlowSDK MQTT-over-QUIC test client for EMQX Common Test suites"
+    about = "FlowSDK MQTT scenario tests over QUIC and TCP"
 )]
 struct Cli {
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
 
-    #[arg(long, default_value_t = 14567)]
-    port: u16,
+    #[arg(long)]
+    port: Option<u16>,
+
+    #[arg(long, value_enum, default_value_t = Transport::Quic)]
+    transport: Transport,
 
     #[arg(long, default_value = "localhost")]
     server_name: String,
@@ -28,8 +32,20 @@ struct Cli {
     #[arg(long, default_value = "hello from flowsdk mqtt_quic_tests")]
     payload: String,
 
-    #[arg(long, default_value_t = Scenario::MultiStream, value_parser = Scenario::parse)]
-    scenario: Scenario,
+    #[arg(long, conflicts_with_all = ["script", "check_script", "list_scenarios"])]
+    scenario: Option<String>,
+
+    #[arg(long, conflicts_with_all = ["scenario", "check_script", "list_scenarios"])]
+    script: Option<PathBuf>,
+
+    #[arg(long, conflicts_with_all = ["script", "scenario", "list_scenarios"])]
+    check_script: Option<PathBuf>,
+
+    #[arg(long, conflicts_with_all = ["script", "scenario", "check_script"])]
+    list_scenarios: bool,
+
+    #[arg(long, default_value_t = 120_000, value_parser = clap::value_parser!(u64).range(1..=86_400_000))]
+    scenario_timeout_ms: u64,
 
     #[arg(long, default_value_t = 1, value_parser = parse_qos)]
     pub_qos: u8,
@@ -51,6 +67,10 @@ struct Cli {
 
     #[arg(long)]
     session_expiry_interval: Option<u32>,
+
+    /// Directory for explicit DSL session checkpoints shared between runner processes.
+    #[arg(long)]
+    session_store_dir: Option<PathBuf>,
 
     #[arg(long)]
     maximum_packet_size: Option<u32>,
@@ -112,7 +132,68 @@ struct Cli {
 
 fn main() {
     let cli = Cli::parse();
-    match run(cli.into_run_config()) {
+    if cli.list_scenarios {
+        let mut names = Scenario::ALL.iter().map(|s| s.as_str()).collect::<Vec<_>>();
+        names.extend(dsl::bundled_names());
+        names.sort_unstable();
+        names.dedup();
+        for name in names {
+            println!(
+                "{name}\t{}",
+                if dsl::bundled(name).is_some() {
+                    "rhai"
+                } else {
+                    "legacy"
+                }
+            );
+        }
+        return;
+    }
+    if let Some(path) = &cli.check_script {
+        let source = read_script(path);
+        if let Err(err) = dsl::check_source(&path.display().to_string(), &source) {
+            eprintln!("{err}");
+            std::process::exit(2);
+        }
+        return;
+    }
+    let name = cli.scenario.clone().unwrap_or_else(|| {
+        if cli.transport == Transport::Tcp {
+            "pubsub".into()
+        } else {
+            "multistream".into()
+        }
+    });
+    let script = cli
+        .script
+        .as_ref()
+        .map(|path| (path.display().to_string(), read_script(path)))
+        .or_else(|| dsl::bundled(&name).map(|source| (name.clone(), source.to_owned())));
+    let options = ScriptOptions {
+        transport: cli.transport,
+        scenario_timeout: Duration::from_millis(cli.scenario_timeout_ms),
+        session_store_dir: cli.session_store_dir.clone(),
+    };
+    if let Some((source_name, source)) = script {
+        let report = dsl::run_source(&source_name, &source, cli.into_run_config(), options);
+        println!("{}", serde_json::to_string_pretty(&report).unwrap());
+        std::process::exit(report.exit_code());
+    }
+    if cli.transport == Transport::Tcp {
+        eprintln!("scenario {name:?} has not been migrated to DSL; legacy scenarios require QUIC");
+        std::process::exit(2);
+    }
+    if cli.session_store_dir.is_some() {
+        eprintln!("--session-store-dir requires a DSL scenario");
+        std::process::exit(2);
+    }
+    let scenario = Scenario::parse(&name).unwrap_or_else(|err| {
+        eprintln!("{err}");
+        std::process::exit(2);
+    });
+    let mut cfg = cli.into_run_config();
+    cfg.scenario = scenario;
+    match run(cfg) {
         Ok(report) => {
             println!("{}", serde_json::to_string_pretty(&report).unwrap());
         }
@@ -127,12 +208,20 @@ impl Cli {
     fn into_run_config(self) -> RunConfig {
         RunConfig {
             host: self.host,
-            port: self.port,
+            port: self.port.unwrap_or(if self.transport == Transport::Tcp {
+                1883
+            } else {
+                14567
+            }),
             server_name: self.server_name,
             client_id: self.client_id,
             topic: self.topic,
             payload: self.payload.into_bytes(),
-            scenario: self.scenario,
+            scenario: self
+                .scenario
+                .as_deref()
+                .and_then(|name| Scenario::parse(name).ok())
+                .unwrap_or(Scenario::Connect),
             pub_qos: self.pub_qos,
             sub_qos: self.sub_qos,
             timeout: Duration::from_millis(self.timeout_ms),
@@ -164,6 +253,13 @@ impl Cli {
             will_retain: self.will_retain,
         }
     }
+}
+
+fn read_script(path: &std::path::Path) -> String {
+    std::fs::read_to_string(path).unwrap_or_else(|err| {
+        eprintln!("{}: {err}", path.display());
+        std::process::exit(2);
+    })
 }
 
 fn parse_qos(value: &str) -> Result<u8, String> {

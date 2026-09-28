@@ -91,6 +91,7 @@ jobs:
           asset="mqtt_quic_test-${{ matrix.asset }}"
           mkdir -p "dist/${asset}"
           cp "target/${{ matrix.target }}/release/mqtt_quic_test" "dist/${asset}/"
+          cp -R scenarios examples "dist/${asset}/"
           tar -C dist -czf "${asset}.tar.gz" "${asset}"
           shasum -a 256 "${asset}.tar.gz" > "${asset}.tar.gz.sha256"
 
