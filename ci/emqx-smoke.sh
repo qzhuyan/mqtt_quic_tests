@@ -5,7 +5,7 @@ EMQX_IMAGE="${EMQX_IMAGE:-emqx/emqx:5.10.4}"
 EMQX_CONTAINER="${EMQX_CONTAINER:-mqtt-quic-tests-emqx}"
 EMQX_QUIC_PORT="${EMQX_QUIC_PORT:-14567}"
 EMQX_DASHBOARD_PORT="${EMQX_DASHBOARD_PORT:-18083}"
-SCENARIOS="${SCENARIOS:-connect pubsub multistream multistream-pub-5x100 parallel-no-blocking}"
+SCENARIOS="${SCENARIOS:-connect pubsub multistream unsubscribe duplicate-subscribe multistream-pub-5x100 parallel-no-blocking}"
 
 cleanup() {
     docker logs "$EMQX_CONTAINER" || true
@@ -42,6 +42,24 @@ curl --fail --silent --show-error "http://127.0.0.1:${EMQX_DASHBOARD_PORT}/statu
 cargo build --locked --bin mqtt_quic_test
 
 for scenario in $SCENARIOS; do
+    # Exercise the no-ACK QoS 0 path as well as acknowledged publications.
+    for qos in 0 1 2; do
+        target/debug/mqtt_quic_test \
+            --host 127.0.0.1 \
+            --port "$EMQX_QUIC_PORT" \
+            --server-name localhost \
+            --insecure \
+            --timeout-ms 30000 \
+            --client-id "mqtt-quic-ci-${scenario}-${qos}" \
+            --topic "mqtt/quic/ci/${scenario}/${qos}" \
+            --pub-qos "$qos" \
+            --sub-qos "$qos" \
+            --scenario "$scenario"
+    done
+done
+
+# These scenarios select their own QoS and session settings.
+for scenario in persistent-no-will persistent-will-delay-equal persistent-will-delay-zero persistent-will-delay-expiry mqtt-v5-session session-store-qos1 session-store-qos2; do
     target/debug/mqtt_quic_test \
         --host 127.0.0.1 \
         --port "$EMQX_QUIC_PORT" \

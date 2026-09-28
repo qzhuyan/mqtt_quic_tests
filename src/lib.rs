@@ -1,3 +1,5 @@
+pub mod dsl;
+
 use flowsdk::mqtt_client::commands::{PublishCommand, SubscribeCommand, UnsubscribeCommand};
 use flowsdk::mqtt_client::engine::{
     MqttEvent, QuicMqttEngine, QuicZeroRttConfig, QuicZeroRttStatus,
