@@ -6,7 +6,8 @@ use flowsdk::mqtt_client::engine::{
 };
 use flowsdk::mqtt_client::opts::MqttClientOptions;
 use flowsdk::mqtt_client::{
-    ConnectionResult, MqttClientError, PublishResult, SubscribeResult, UnsubscribeResult,
+    ClientSessionState, ConnectionResult, MqttClientError, PublishResult, SubscribeResult,
+    UnsubscribeResult,
 };
 use flowsdk::mqtt_serde::control_packet::MqttPacket;
 use flowsdk::mqtt_serde::mqttv5::common::properties::Property;
@@ -698,6 +699,13 @@ struct PubRelSeen {
 
 impl QuicDriver {
     fn connect(cfg: RunConfig) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::connect_with_session(cfg, None)
+    }
+
+    fn connect_with_session(
+        cfg: RunConfig,
+        saved: Option<ClientSessionState>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let server_addr = (cfg.host.as_str(), cfg.port)
             .to_socket_addrs()?
             .next()
@@ -746,6 +754,9 @@ impl QuicDriver {
 
         let crypto = build_crypto_config(&cfg)?;
         let mut engine = QuicMqttEngine::new(opts.build())?;
+        if let Some(saved) = saved {
+            engine.engine_mut().restore_session_state(saved)?;
+        }
         engine.connect(server_addr, &cfg.server_name, crypto, Instant::now())?;
 
         let mut report = ScenarioReport::new(&cfg);
@@ -2398,8 +2409,10 @@ impl QuicDriver {
             })
             .ok_or("persistent anonymous session was not assigned a client id")?;
         anonymous.graceful_disconnect()?;
-        let mut assigned_resume =
-            self.connect_peer(&assigned_id, false, Some(30), Scenario::Connect)?;
+        let mut assigned_resume = anonymous.reconnect_with_saved_session(Scenario::Connect)?;
+        if assigned_resume.cfg.client_id != assigned_id {
+            return Err("restored session did not preserve the broker-assigned client id".into());
+        }
         if !assigned_resume.last_connection_result()?.session_present {
             return Err("assigned client id did not resume its persistent session".into());
         }
@@ -2478,8 +2491,7 @@ impl QuicDriver {
             publisher.wait_for_publish_result()?;
         }
 
-        let mut resumed =
-            self.connect_peer(&client_id, false, Some(30), Scenario::PersistentOfflineQos1)?;
+        let mut resumed = self.reconnect_with_saved_session(self.cfg.scenario)?;
         if !resumed.last_connection_result()?.session_present {
             return Err("offline subscription session was not resumed".into());
         }
@@ -2534,7 +2546,10 @@ impl QuicDriver {
                 .packet_id
                 .ok_or("QoS 1 delivery omitted packet id")?;
             let stream = self.stream_or_control(message.stream)?;
-            self.engine.puback_on(stream, packet_id)?;
+            self.engine.acknowledge_on(
+                stream,
+                MqttPacket::PubAck5(pubackv5::MqttPubAck::new(packet_id, 0, Vec::new())),
+            )?;
         }
         self.ping_barrier()?;
         self.graceful_disconnect()?;
@@ -2549,7 +2564,7 @@ impl QuicDriver {
         ];
         publisher.publish_batch_and_wait(&offline_batch)?;
 
-        let mut resumed = self.connect_peer(&client_id, false, Some(30), Scenario::Connect)?;
+        let mut resumed = self.reconnect_with_saved_session(Scenario::Connect)?;
         let unacked = &first_messages[4..];
         let expected_count = unacked.len() + offline_batch.len();
         resumed.wait_for_received_publish_count(expected_count)?;
@@ -2620,11 +2635,15 @@ impl QuicDriver {
 
         for message in first_messages.iter().filter(|message| message.qos == 1) {
             let stream = self.stream_or_control(message.stream)?;
-            self.engine.puback_on(
+            self.engine.acknowledge_on(
                 stream,
-                message
-                    .packet_id
-                    .ok_or("QoS 1 delivery omitted packet id")?,
+                MqttPacket::PubAck5(pubackv5::MqttPubAck::new(
+                    message
+                        .packet_id
+                        .ok_or("QoS 1 delivery omitted packet id")?,
+                    0,
+                    Vec::new(),
+                )),
             )?;
         }
         let first_qos2 = first_messages
@@ -2635,11 +2654,15 @@ impl QuicDriver {
             .collect::<Vec<_>>();
         for message in &first_qos2 {
             let stream = self.stream_or_control(message.stream)?;
-            self.engine.pubrec_on(
+            self.engine.acknowledge_on(
                 stream,
-                message
-                    .packet_id
-                    .ok_or("QoS 2 delivery omitted packet id")?,
+                MqttPacket::PubRec5(pubrecv5::MqttPubRec::new(
+                    message
+                        .packet_id
+                        .ok_or("QoS 2 delivery omitted packet id")?,
+                    0,
+                    Vec::new(),
+                )),
             )?;
         }
         self.ping_barrier()?;
@@ -2663,8 +2686,7 @@ impl QuicDriver {
         .collect::<Vec<_>>();
         publisher.publish_batch_and_wait(&offline_batch)?;
 
-        let mut resumed =
-            self.connect_peer(&client_id, false, Some(30), Scenario::PersistentManyQos2)?;
+        let mut resumed = self.reconnect_for_redelivery(Scenario::PersistentManyQos2)?;
         resumed.drive_for(Duration::from_secs(2))?;
         let resumed_pubrels = resumed
             .pubrels
@@ -2725,7 +2747,10 @@ impl QuicDriver {
             let packet_id = message
                 .packet_id
                 .ok_or("replayed QoS 2 message omitted packet id")?;
-            resumed.engine.pubrec_on(stream, packet_id)?;
+            resumed.engine.acknowledge_on(
+                stream,
+                MqttPacket::PubRec5(pubrecv5::MqttPubRec::new(packet_id, 0, Vec::new())),
+            )?;
             let expected_stream = resumed.event_stream(stream);
             resumed.wait_for_pubrel(packet_id, expected_stream)?;
         }
@@ -2741,14 +2766,16 @@ impl QuicDriver {
                 .cloned()
                 .ok_or_else(|| format!("PUBREL {packet_id} was not observed"))?;
             let stream = resumed.stream_or_control(pubrel.stream)?;
-            resumed.engine.pubcomp_on(stream, *packet_id)?;
+            resumed.engine.acknowledge_on(
+                stream,
+                MqttPacket::PubComp5(pubcompv5::MqttPubComp::new(*packet_id, 0, Vec::new())),
+            )?;
         }
         resumed.ping_barrier()?;
         resumed.graceful_disconnect()?;
         std::thread::sleep(Duration::from_millis(500));
 
-        let mut final_resume =
-            self.connect_peer(&client_id, false, Some(30), Scenario::PersistentManyQos2)?;
+        let mut final_resume = resumed.reconnect_for_redelivery(Scenario::PersistentManyQos2)?;
         final_resume.wait_for_received_publish_count(3)?;
         let final_messages = &final_resume.received_publishes[..3];
         let final_payloads = final_messages
@@ -2799,8 +2826,7 @@ impl QuicDriver {
         clean.wait_for_message_after(&topic, b"current", 0)?;
         clean.graceful_disconnect()?;
 
-        let mut resumed =
-            self.connect_peer(&client_id, false, Some(30), Scenario::PersistentCleanStart)?;
+        let mut resumed = clean.reconnect_with_saved_session(Scenario::PersistentCleanStart)?;
         if !resumed.last_connection_result()?.session_present {
             return Err("replacement subscription was not persisted".into());
         }
@@ -2878,7 +2904,7 @@ impl QuicDriver {
         }
         self.graceful_disconnect()?;
 
-        let mut resumed = self.connect_peer(&client_id, false, Some(30), Scenario::Connect)?;
+        let mut resumed = self.reconnect_with_saved_session(Scenario::Connect)?;
         publisher
             .engine
             .publish(publish_cmd(&topic, b"after-resume", 2)?)?;
@@ -2925,7 +2951,7 @@ impl QuicDriver {
                 .publish(publish_cmd(&topic1, payload, qos)?)?;
             publisher.wait_for_publish_result()?;
         }
-        let mut resumed = self.connect_peer(&client_id, false, Some(30), Scenario::Connect)?;
+        let mut resumed = self.reconnect_for_redelivery(Scenario::Connect)?;
         resumed.wait_for_received_publish_count(4)?;
         resumed.drive_for(Duration::from_millis(500))?;
         let messages = &resumed.received_publishes;
@@ -2993,12 +3019,7 @@ impl QuicDriver {
             .engine
             .publish(publish_cmd(&topic, b"two-matches", 2)?)?;
         publisher.wait_for_publish_result()?;
-        let mut resumed = self.connect_peer(
-            &client_id,
-            false,
-            Some(30),
-            Scenario::PersistentMultipleMatches,
-        )?;
+        let mut resumed = self.reconnect_with_saved_session(Scenario::PersistentMultipleMatches)?;
         resumed.wait_for_topic_message_count_after(&topic, 0, 2)?;
         if resumed.received_publishes[..2]
             .iter()
@@ -3011,7 +3032,6 @@ impl QuicDriver {
     }
 
     fn scenario_persistent_sys_messages(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let client_id = self.cfg.client_id.clone();
         let filter = "$SYS/brokers/+/uptime";
         self.send_subscribe_on_control(
             SubscribeCommand::builder()
@@ -3027,8 +3047,7 @@ impl QuicDriver {
             return Err("system heartbeat delivery metadata was unexpected".into());
         }
         self.graceful_disconnect()?;
-        let mut resumed =
-            self.connect_peer(&client_id, false, Some(30), Scenario::PersistentSysMessages)?;
+        let mut resumed = self.reconnect_with_saved_session(Scenario::PersistentSysMessages)?;
         resumed.wait_for_received_publish_count(1)?;
         resumed.graceful_disconnect()
     }
@@ -3078,7 +3097,43 @@ impl QuicDriver {
         cfg.hold_after_connect = Duration::ZERO;
         cfg.will_enabled = false;
         cfg.will_topic = None;
-        self.connect_peer_with_config(cfg)
+        self.connect_peer_with_config(cfg, None)
+    }
+
+    fn reconnect_with_saved_session(
+        &mut self,
+        scenario: Scenario,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let saved = self.engine.engine().snapshot_session()?;
+        self.reconnect_from_snapshot(scenario, saved)
+    }
+
+    fn reconnect_for_redelivery(
+        &mut self,
+        scenario: Scenario,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let saved = replay_checkpoint(self.engine.engine().snapshot_session()?)?;
+        self.reconnect_from_snapshot(scenario, saved)
+    }
+
+    fn reconnect_from_snapshot(
+        &mut self,
+        scenario: Scenario,
+        saved: ClientSessionState,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut cfg = self.cfg.clone();
+        cfg.client_id = saved.client_id().to_owned();
+        cfg.clean_start = false;
+        cfg.scenario = scenario;
+        cfg.ready_file = None;
+        cfg.hold_after_connect = Duration::ZERO;
+        cfg.will_enabled = false;
+        cfg.will_topic = None;
+        let peer = self.connect_peer_with_config(cfg, Some(saved))?;
+        if !peer.last_connection_result()?.session_present {
+            return Err("persistent session resume did not set Session Present".into());
+        }
+        Ok(peer)
     }
 
     fn connect_peer_with_will(
@@ -3090,15 +3145,16 @@ impl QuicDriver {
         cfg.scenario = Scenario::Connect;
         cfg.ready_file = None;
         cfg.hold_after_connect = Duration::ZERO;
-        self.connect_peer_with_config(cfg)
+        self.connect_peer_with_config(cfg, None)
     }
 
     fn connect_peer_with_config(
         &mut self,
         cfg: RunConfig,
+        saved: Option<ClientSessionState>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let client_id = cfg.client_id.clone();
-        let mut peer = Self::connect(cfg)?;
+        let mut peer = Self::connect_with_session(cfg, saved)?;
         let deadline = Instant::now() + self.cfg.timeout;
         let mut connected = false;
         while Instant::now() < deadline {
@@ -3107,6 +3163,13 @@ impl QuicDriver {
                 .iter()
                 .any(|event| matches!(event, MqttEvent::Connected(result) if result.is_success()));
             peer.observe(&peer_events);
+            if !peer.report.errors.is_empty() {
+                return Err(format!(
+                    "failed connecting peer {client_id}: {:?}",
+                    peer.report.errors
+                )
+                .into());
+            }
 
             let events = self.step()?;
             self.observe(&events);
@@ -4129,6 +4192,31 @@ fn has_property(properties: &[Property], expected: &Property) -> bool {
     properties.iter().any(|property| property == expected)
 }
 
+fn replay_checkpoint(
+    saved: ClientSessionState,
+) -> Result<ClientSessionState, Box<dyn std::error::Error>> {
+    // Broker replay tests model a crash before un-PUBRECed deliveries were accepted.
+    // Keep PUBREC/PUBREL state for exactly-once recovery, but expose retransmitted
+    // PUBLISH packets to the test instead of suppressing them as app duplicates.
+    if saved.version() != 1 {
+        return Err("unsupported checkpoint schema for broker replay test".into());
+    }
+    let mut value = serde_json::to_value(saved)?;
+    let received = value["received"]
+        .as_array_mut()
+        .ok_or("checkpoint is missing received exchanges")?;
+    for entry in received.iter() {
+        if !matches!(
+            entry["stage"].as_str(),
+            Some("Publish" | "PubRec" | "PubRel")
+        ) {
+            return Err("checkpoint contains an unknown receive stage".into());
+        }
+    }
+    received.retain(|entry| entry["stage"] != "Publish");
+    Ok(serde_json::from_value(value)?)
+}
+
 fn mqtt_connect_properties(cfg: &RunConfig) -> Vec<Property> {
     let mut properties = Vec::new();
     if let Some(interval) = cfg
@@ -4258,6 +4346,63 @@ impl fmt::Display for Scenario {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flowsdk::mqtt_client::engine::MqttEngine;
+
+    #[test]
+    fn replay_checkpoint_preserves_acknowledged_qos2_exchanges() {
+        let options = || {
+            MqttClientOptions::builder()
+                .peer("localhost:14567")
+                .client_id("replay-checkpoint")
+                .clean_start(false)
+                .session_expiry_interval(30)
+                .auto_ack(false)
+                .build()
+        };
+        let mut engine = MqttEngine::new(options());
+        engine.connect().unwrap();
+        engine.take_outgoing();
+        let connected = engine.handle_incoming(&[0x20, 3, 0, 0, 0]);
+        assert!(
+            matches!(connected.as_slice(), [MqttEvent::Connected(result)] if result.is_success())
+        );
+        for id in 1..=3 {
+            let bytes = mqtt_v5_publish_bytes("replay", &[id as u8], 2, id).unwrap();
+            engine.handle_incoming(&bytes);
+        }
+        engine.pubrec(1, 0, Vec::new()).unwrap();
+        engine.pubrec(2, 0, Vec::new()).unwrap();
+        engine.take_outgoing();
+        engine.handle_incoming(&[0x62, 2, 0, 2]);
+        let saved = engine.snapshot_session().unwrap();
+        let mut expected = serde_json::to_value(&saved).unwrap();
+        assert_eq!(expected["received"].as_array().unwrap().len(), 3);
+        expected["received"].as_array_mut().unwrap().pop();
+        let saved = replay_checkpoint(saved).unwrap();
+        assert_eq!(serde_json::to_value(&saved).unwrap(), expected);
+
+        let mut restored = MqttEngine::new(options());
+        restored.restore_session_state(saved).unwrap();
+        restored.connect().unwrap();
+        restored.take_outgoing();
+        let events = restored.handle_incoming(&[0x20, 3, 1, 0, 0]);
+        assert!(
+            matches!(events.as_slice(), [MqttEvent::Connected(result)] if result.session_present)
+        );
+        for id in [1, 2] {
+            let events = restored.handle_incoming(&[0x62, 2, 0, id]);
+            assert!(
+                matches!(events.as_slice(), [MqttEvent::PubRelReceived { packet_id, .. }] if *packet_id == u16::from(id))
+            );
+            restored.pubcomp(u16::from(id), 0, Vec::new()).unwrap();
+        }
+        let mut bytes = mqtt_v5_publish_bytes("replay", &[3], 2, 3).unwrap();
+        bytes[0] |= 8;
+        let events = restored.handle_incoming(&bytes);
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, MqttEvent::MessageReceived(message) if message.dup)));
+    }
 
     #[test]
     fn scenario_parser_accepts_known_names() {
