@@ -22,6 +22,9 @@ docker run \
     --publish "${EMQX_QUIC_PORT}:14567/udp" \
     --publish "${EMQX_DASHBOARD_PORT}:18083" \
     --env EMQX_NODE__COOKIE=mqtt_quic_tests \
+    --env EMQX_AUTHORIZATION__SOURCES='[]' \
+    --env EMQX_AUTHORIZATION__NO_MATCH=allow \
+    --env EMQX_SYS_TOPICS__SYS_HEARTBEAT_INTERVAL=1s \
     --env EMQX_LISTENERS__QUIC__DEFAULT__ENABLE=true \
     --env EMQX_LISTENERS__QUIC__DEFAULT__BIND=14567 \
     --env EMQX_LISTENERS__QUIC__DEFAULT__SSL_OPTIONS__CACERTFILE='${EMQX_ETC_DIR}/certs/cacert.pem' \
@@ -56,6 +59,24 @@ for scenario in $SCENARIOS; do
             --sub-qos "$qos" \
             --scenario "$scenario"
     done
+done
+
+# Legacy persistence scenarios require an explicit MQTT session lifetime.
+for scenario in persistent-session-controls persistent-offline-qos1 persistent-offline-qos2 persistent-many-qos1 persistent-many-qos2 persistent-clean-start persistent-expiry persistent-unsubscribe persistent-unsubscribe-replay persistent-multiple-matches persistent-sys-messages; do
+    expiry=30
+    if [[ "$scenario" == persistent-expiry ]]; then
+        expiry=1
+    fi
+    target/debug/mqtt_quic_test \
+        --host 127.0.0.1 \
+        --port "$EMQX_QUIC_PORT" \
+        --server-name localhost \
+        --insecure \
+        --timeout-ms 30000 \
+        --session-expiry-interval "$expiry" \
+        --client-id "mqtt-quic-ci-${scenario}" \
+        --topic "mqtt/quic/ci/${scenario}" \
+        --scenario "$scenario"
 done
 
 # These scenarios select their own QoS and session settings.
